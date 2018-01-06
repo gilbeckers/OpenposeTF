@@ -2,8 +2,8 @@ import os
 
 import tensorflow as tf
 
-from network_cmu import CmuNetwork
-from network_mobilenet import MobilenetNetwork
+from src.network_cmu import CmuNetwork
+from src.network_mobilenet import MobilenetNetwork
 
 
 def _get_base_path():

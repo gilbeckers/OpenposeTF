@@ -3,201 +3,122 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import os.path
-import re
-import sys
-import tarfile
 import Algorithmia
 import numpy as np
 import tensorflow as tf
-from tensorflow.python.client import device_lib
-from PIL import Image
-import base64
-import urllib, cStringIO, json, io
-import re
-FLAGS = tf.app.flags.FLAGS
-img_dimension = 1650
+import cv2
+import time
+import logging
+from tensorflow.python.client import timeline
 
-# classify_image_graph_def.pb:
-#   Binary representation of the GraphDef protocol buffer.
-# imagenet_synset_to_human_label_map.txt:
-#   Map from synset ID to a human readable string.
-# imagenet_2012_challenge_label_map_proto.pbtxt:
-#   Text representation of a protocol buffer mapping a label to synset ID.
-tf.app.flags.DEFINE_string(
-    'model_dir', '/tmp/imagenet',
-    """Path to classify_image_graph_def.pb, """
-    """imagenet_synset_to_human_label_map.txt, and """
-    """imagenet_2012_challenge_label_map_proto.pbtxt.""")
+from src.common import estimate_pose, CocoPairsRender, read_imgfile, CocoColors, draw_humans
+from src.networks import get_network
+from src.pose_dataset import CocoPoseLMDB
 
-DATA_URL = 'data://bilgeckers/InceptionTF/inception-2015-12-05.tgz'
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+
+config = tf.ConfigProto()
+config.gpu_options.allocator_type = 'BFC'
+config.gpu_options.per_process_gpu_memory_fraction = 0.95
+config.gpu_options.allow_growth = True
 
 client = Algorithmia.client()
 
-class AlgorithmError(Exception):
-     def __init__(self, value):
-         self.value = value
-     def __str__(self):
-         return repr(self.value)
-     
-class NodeLookup(object):
-  """Converts integer node ID's to human readable labels."""
-
-  def __init__(self,
-               label_lookup_path=None,
-               uid_lookup_path=None):
-    if not label_lookup_path:
-      label_lookup_path = os.path.join(
-          FLAGS.model_dir, 'imagenet_2012_challenge_label_map_proto.pbtxt')
-    if not uid_lookup_path:
-      uid_lookup_path = os.path.join(
-          FLAGS.model_dir, 'imagenet_synset_to_human_label_map.txt')
-    self.node_lookup = self.load(label_lookup_path, uid_lookup_path)
-
-  def load(self, label_lookup_path, uid_lookup_path):
-    """Loads a human readable English name for each softmax node.
-
-    Args:
-      label_lookup_path: string UID to integer node ID.
-      uid_lookup_path: string UID to human-readable string.
-
-    Returns:
-      dict from integer node ID to human-readable string.
+def interference():
     """
-    if not tf.gfile.Exists(uid_lookup_path):
-      tf.logging.fatal('File does not exist %s', uid_lookup_path)
-    if not tf.gfile.Exists(label_lookup_path):
-      tf.logging.fatal('File does not exist %s', label_lookup_path)
+    parser = argparse.ArgumentParser(description='Tensorflow Openpose Inference')
+    parser.add_argument('--imgpath', type=str, default='./images/p2.jpg')
+    parser.add_argument('--input-width', type=int, default=368)
+    parser.add_argument('--input-height', type=int, default=368)
+    parser.add_argument('--stage-level', type=int, default=6)
+    parser.add_argument('--model', type=str, default='mobilenet',
+                        help='cmu / mobilenet / mobilenet_accurate / mobilenet_fast')
+    args = parser.parse_args()
+    """
+    input_height = 368
+    input_width = 368
+    imgpath = './images/p2.jpg'
+    stage_level = 6
+    model = 'mobilenet'
 
-    # Loads mapping from string UID to human-readable string
-    proto_as_ascii_lines = tf.gfile.GFile(uid_lookup_path).readlines()
-    uid_to_human = {}
-    p = re.compile(r'[n\d]*[ \S,]*')
-    for line in proto_as_ascii_lines:
-      parsed_items = p.findall(line)
-      uid = parsed_items[0]
-      human_string = parsed_items[2]
-      uid_to_human[uid] = human_string
+    input_node = tf.placeholder(tf.float32, shape=(1, input_height, input_width, 3), name='image')
 
-    # Loads mapping from string UID to integer node ID.
-    node_id_to_uid = {}
-    proto_as_ascii = tf.gfile.GFile(label_lookup_path).readlines()
-    for line in proto_as_ascii:
-      if line.startswith('  target_class:'):
-        target_class = int(line.split(': ')[1])
-      if line.startswith('  target_class_string:'):
-        target_class_string = line.split(': ')[1]
-        node_id_to_uid[target_class] = target_class_string[1:-2]
+    with tf.Session(config=config) as sess:
+        net, _, last_layer = get_network(model, input_node, sess)
 
-    # Loads the final mapping of integer node ID to human-readable string
-    node_id_to_name = {}
-    for key, val in node_id_to_uid.items():
-      if val not in uid_to_human:
-        tf.logging.fatal('Failed to locate: %s', val)
-      name = uid_to_human[val]
-      node_id_to_name[key] = name
+        logging.debug('read image+')
+        image = read_imgfile(imgpath, input_width, input_height)
+        vec = sess.run(net.get_output(name='concat_stage7'), feed_dict={'image:0': [image]})
 
-    return node_id_to_name
+        a = time.time()
+        run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+        run_metadata = tf.RunMetadata()
+        pafMat, heatMat = sess.run(
+            [
+                net.get_output(name=last_layer.format(stage=stage_level, aux=1)),
+                net.get_output(name=last_layer.format(stage=stage_level, aux=2))
+            ], feed_dict={'image:0': [image]}, options=run_options, run_metadata=run_metadata
+        )
+        logging.info('inference- elapsed_time={}'.format(time.time() - a))
 
-  def id_to_string(self, node_id):
-    if node_id not in self.node_lookup:
-      return ''
-    return self.node_lookup[node_id]
+        tl = timeline.Timeline(run_metadata.step_stats)
+        ctf = tl.generate_chrome_trace_format()
+        with open('timeline.json', 'w') as f:
+            f.write(ctf)
+        heatMat, pafMat = heatMat[0], pafMat[0]
 
+        logging.debug('inference+')
 
-def create_graph():
-  """Creates a graph from saved GraphDef file and returns a saver."""
-  # Creates graph from saved graph_def.pb.
-  with tf.gfile.FastGFile(os.path.join(
-      '/tmp/imagenet', 'classify_image_graph_def.pb'), 'rb') as f:
-    graph_def = tf.GraphDef()
-    graph_def.ParseFromString(f.read())
-    _ = tf.import_graph_def(graph_def, name='')
+        avg = 0
+        for _ in range(10):
+            a = time.time()
+            sess.run(
+                [
+                    net.get_output(name=last_layer.format(stage=stage_level, aux=1)),
+                    net.get_output(name=last_layer.format(stage=stage_level, aux=2))
+                ], feed_dict={'image:0': [image]}
+            )
+            logging.info('inference- elapsed_time={}'.format(time.time() - a))
+            avg += time.time() - a
+        logging.info('prediction avg= %f' % (avg / 10))
 
+        '''
+        logging.info('pickle data')
+        with open('person3.pickle', 'wb') as pickle_file:
+            pickle.dump(image, pickle_file, pickle.HIGHEST_PROTOCOL)
+        with open('heatmat.pickle', 'wb') as pickle_file:
+            pickle.dump(heatMat, pickle_file, pickle.HIGHEST_PROTOCOL)
+        with open('pafmat.pickle', 'wb') as pickle_file:
+            pickle.dump(pafMat, pickle_file, pickle.HIGHEST_PROTOCOL)
+        '''
 
-def run_inference_on_image(image):
-  """Runs inference on an image.
+        logging.info('pose+')
+        a = time.time()
+        humans = estimate_pose(heatMat, pafMat)
+        logging.info('pose- elapsed_time={}'.format(time.time() - a))
 
-  Args:
-    image: Image file name.
+        logging.info('image={} heatMap={} pafMat={}'.format(image.shape, heatMat.shape, pafMat.shape))
+        process_img = CocoPoseLMDB.display_image(image, heatMat, pafMat, as_numpy=True)
 
-  Returns:
-    result dict
-  """
-    
-  if not tf.gfile.Exists(image):
-    tf.logging.fatal('File does not exist %s', image)
-  image_data = tf.gfile.FastGFile(image, 'rb').read()
+        # display
+        image = cv2.imread(imgpath)
+        image_h, image_w = image.shape[:2]
+        image = draw_humans(image, humans)
 
-  # Creates graph from saved GraphDef.
+        scale = 480.0 / image_h
+        newh, neww = 480, int(scale * image_w + 0.5)
 
-  with tf.Session() as sess:
-    # Some useful tensors:
-    # 'softmax:0': A tensor containing the normalized prediction across
-    #   1000 labels.
-    # 'pool_3:0': A tensor containing the next-to-last layer containing 2048
-    #   float description of the image.
-    # 'DecodeJpeg/contents:0': A tensor containing a string providing JPEG
-    #   encoding of the image.
-    # Runs the softmax tensor by feeding the image_data as input to the graph.
-    softmax_tensor = sess.graph.get_tensor_by_name('softmax:0')
-    predictions = sess.run(softmax_tensor,
-                           {'DecodeJpeg/contents:0': image_data})
-    predictions = np.squeeze(predictions)
+        image = cv2.resize(image, (neww, newh), interpolation=cv2.INTER_AREA)
 
-    # Creates node ID --> English string lookup.
-    node_lookup = NodeLookup()
+        convas = np.zeros([480, 640 + neww, 3], dtype=np.uint8)
+        convas[:, :640] = process_img
+        convas[:, 640:] = image
 
-    tags = []
-    
-    top_k = predictions.argsort()[-5:][::-1]
-    for node_id in top_k:
-      human_string = node_lookup.id_to_string(node_id)
-      score = predictions[node_id]
-      result = {}
-      result['class'] = human_string
-      result['confidence'] = np.asscalar(score)
-      tags.append(result)
-    results = {}
-    results['tags'] = tags
-    return results
+        cv2.imshow('result', convas)
+        cv2.waitKey(0)
 
+        tf.train.write_graph(sess.graph_def, '.', 'graph-tmp.pb', as_text=True)
 
-def maybe_download_and_extract():
-  """Download and extract model tar file."""
-  dest_directory = FLAGS.model_dir
-  if not os.path.exists(dest_directory):
-    os.makedirs(dest_directory)
-  filename = DATA_URL.split('/')[-1]
-  filepath = os.path.join(dest_directory, filename)
-  if not os.path.exists(filepath):
-      filepath = client.file(DATA_URL).getFile().name
-  tarfile.open(filepath, 'r:gz').extractall(dest_directory)
-
-# Don't use the old function anymore
-# Use util/SmartImageDownloader instead for http(s)/data URLs
-def get_image(imagesrc):
-    sid_input = {"image": imagesrc, "resize": img_dimension, "format": "jpeg"}
-    res = client.algo("util/SmartImageDownloader/0.2.x").pipe(sid_input).result
-    image_data_location = res["savePath"][0]
-    image_dimensions = res["originalDimensions"][0]
-    image_temp_location = client.file(image_data_location).getFile().name
-    client.file(image_data_location).delete
-    return image_temp_location
-    # if imagesrc.startswith("data:image/jpeg;base64"):
-    #     escapedData = imagesrc.replace('data:image/jpeg;base64,', '').decode('base64')
-    #     return cStringIO.StringIO(escapedData)
-    # else:
-    #     imgDataPath = client.algo("util/SmartImageDownloader").pipe(imagesrc).result["savePath"][0]
-    #     return client.file(imgDataPath).getFile().name
-
-#memory storage funcs, only run once per container creation.
-"""client = Algorithmia.client()
-maybe_download_and_extract()
-create_graph()
-local_device_protos = device_lib.list_local_devices()
-print("DEVICES: %s" % local_device_protos)
-"""
 
 def load_data():
     """Retrieve variable checkpoints and graph from user collection"""
@@ -218,15 +139,11 @@ def create_graph(graph_path):
     graph_def.ParseFromString(f.read())
     _ = tf.import_graph_def(graph_def, name='')
 
-# Get called once
-#saver = tf.train.Saver()
-graph = load_data()
-create_graph(graph)
+interference()
+
 
 def apply(input):
-    
-    #load_data()
-    print(graph)
+
     print("lala")
     
-    return(graph)
+    return("koekoek")
