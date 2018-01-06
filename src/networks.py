@@ -38,7 +38,8 @@ def get_network(type, placeholder_input, sess_for_load=None):
         else:
             s = '%dx%d' % (placeholder_input.shape[2], placeholder_input.shape[1])
             ckpts = {
-                'mobilenet': 'trained/mobilenet_%s/model-release' % s,
+                #'mobilenet': 'trained/mobilenet_%s/model-release' % s,
+                'mobilenet': 'trained/model-388003',
                 'mobilenet_fast': 'trained/mobilenet_fast/model-163000',
                 'mobilenet_accurate': 'trained/mobilenet_accurate/model-170000'
             }
