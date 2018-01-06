@@ -1,2 +1,5 @@
-algorithmia>=1.0.0,<2.0
+algorithmia>=1.0.0,<=2.0
+tensorflow-gpu==1.2.0
+protobuf==3.0.0b2.post1
+numpy
 six
