@@ -13,7 +13,7 @@ from tensorflow.python.client import timeline
 
 from src.common import estimate_pose, CocoPairsRender, read_imgfile, CocoColors, draw_humans
 from src.networks import get_network
-from src.pose_dataset import CocoPoseLMDB
+#from src.pose_dataset import CocoPoseLMDB
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
@@ -98,6 +98,8 @@ def interference():
         logging.info('pose- elapsed_time={}'.format(time.time() - a))
 
         logging.info('image={} heatMap={} pafMat={}'.format(image.shape, heatMat.shape, pafMat.shape))
+
+        """
         process_img = CocoPoseLMDB.display_image(image, heatMat, pafMat, as_numpy=True)
 
         # display
@@ -118,6 +120,7 @@ def interference():
         cv2.waitKey(0)
 
         tf.train.write_graph(sess.graph_def, '.', 'graph-tmp.pb', as_text=True)
+        """
 
 
 def load_data():
